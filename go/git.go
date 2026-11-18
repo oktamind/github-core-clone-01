@@ -510,16 +510,30 @@ func orZero(s string) string {
 }
 
 func v0Advertisement(r *Repo, service string) []byte {
-	key := itoa(r.refVersion) + "|" + service
-	if hit, ok := r.adCache[key]; ok {
+	key := itoa(int(r.refVersion.Load())) + "|" + service
+	if hit := adCacheGet(r, key); hit != nil {
 		return hit
 	}
 	out := buildV0Advertisement(r, service)
+	adCachePut(r, key, out)
+	return out
+}
+
+// adCacheGet is the lock-free fast path: a hit needs no data lock, because
+// the key is built from the atomic refVersion and cached bytes are immutable.
+func adCacheGet(r *Repo, key string) []byte {
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+	return r.adCache[key]
+}
+
+func adCachePut(r *Repo, key string, out []byte) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
 	if len(r.adCache) > 128 {
 		r.adCache = map[string][]byte{}
 	}
 	r.adCache[key] = out
-	return out
 }
 
 var v2Advertisement = bytes.Join([][]byte{
@@ -577,16 +591,28 @@ func buildLsRefs(r *Repo, args []string) []byte {
 }
 
 func handleLsRefs(r *Repo, args []string) []byte {
-	key := itoa(r.refVersion) + "|" + strings.Join(args, "\n")
-	if hit, ok := r.lsRefsCache[key]; ok {
+	key := itoa(int(r.refVersion.Load())) + "|" + strings.Join(args, "\n")
+	if hit := lsRefsCacheGet(r, key); hit != nil {
 		return hit
 	}
 	out := buildLsRefs(r, args)
+	lsRefsCachePut(r, key, out)
+	return out
+}
+
+func lsRefsCacheGet(r *Repo, key string) []byte {
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+	return r.lsRefsCache[key]
+}
+
+func lsRefsCachePut(r *Repo, key string, out []byte) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
 	if len(r.lsRefsCache) > 128 {
 		r.lsRefsCache = map[string][]byte{}
 	}
 	r.lsRefsCache[key] = out
-	return out
 }
 
 func containsStr(list []string, s string) bool {
@@ -726,16 +752,28 @@ func buildFetchV2(r *Repo, args []string) []byte {
 }
 
 func handleFetchV2(r *Repo, args []string) []byte {
-	key := "v2|" + itoa(r.refVersion) + "|" + strings.Join(args, "\n")
-	if hit, ok := r.fetchCache[key]; ok {
+	key := "v2|" + itoa(int(r.refVersion.Load())) + "|" + strings.Join(args, "\n")
+	if hit := fetchCacheGet(r, key); hit != nil {
 		return hit
 	}
 	out := buildFetchV2(r, args)
+	fetchCachePut(r, key, out)
+	return out
+}
+
+func fetchCacheGet(r *Repo, key string) []byte {
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+	return r.fetchCache[key]
+}
+
+func fetchCachePut(r *Repo, key string, out []byte) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
 	if len(r.fetchCache) > 128 {
 		r.fetchCache = map[string][]byte{}
 	}
 	r.fetchCache[key] = out
-	return out
 }
 
 func buildFetchV0(r *Repo, body []byte) []byte {
@@ -831,15 +869,12 @@ func buildFetchV0(r *Repo, body []byte) []byte {
 }
 
 func handleFetchV0(r *Repo, body []byte) []byte {
-	key := "v0|" + itoa(r.refVersion) + "|" + hex.EncodeToString(body)
-	if hit, ok := r.fetchCache[key]; ok {
+	key := "v0|" + itoa(int(r.refVersion.Load())) + "|" + hex.EncodeToString(body)
+	if hit := fetchCacheGet(r, key); hit != nil {
 		return hit
 	}
 	out := buildFetchV0(r, body)
-	if len(r.fetchCache) > 128 {
-		r.fetchCache = map[string][]byte{}
-	}
-	r.fetchCache[key] = out
+	fetchCachePut(r, key, out)
 	return out
 }
 

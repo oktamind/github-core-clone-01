@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/url"
 	"regexp"
@@ -130,13 +131,17 @@ func issueJSON(r *Repo, i *Issue) map[string]any {
 }
 
 func issueJSONBuf(r *Repo, i *Issue) []byte {
-	if hit, ok := r.issueJSONCache[i.number]; ok &&
-		hit.state == i.state && hit.title == i.title && hit.body == i.body &&
-		hit.nComments == len(i.comments) && hit.nLabels == len(i.labels) {
+	ver := r.issueVersion.Load()
+	r.cacheMu.RLock()
+	hit := r.issueJSONCache[i.number]
+	r.cacheMu.RUnlock()
+	if hit != nil && hit.version == ver {
 		return hit.buf
 	}
 	buf := append(marshalJSON(issueJSON(r, i)), '\n')
-	r.issueJSONCache[i.number] = &issueCacheEntry{buf: buf, state: i.state, title: i.title, body: i.body, nComments: len(i.comments), nLabels: len(i.labels)}
+	r.cacheMu.Lock()
+	r.issueJSONCache[i.number] = &issueCacheEntry{buf: buf, version: ver}
+	r.cacheMu.Unlock()
 	return buf
 }
 
@@ -477,6 +482,142 @@ func dispatch(req *request) (resp *response) {
 			resp = jsonErr(500, "Internal Server Error")
 		}
 	}()
+	// Lock-free fast paths (v4): cache hits for the perf-critical reads
+	// need no data lock. Anything else falls through to the serialized path.
+	if req.method == "GET" && req.path == "/healthz" {
+		return jsonResp(200, mustJSON(map[string]any{"ok": true}))
+	}
+	if resp, ok := tryGitFastPath(req); ok {
+		return resp
+	}
+	if resp, ok := tryGetIssueFastPath(req); ok {
+		return resp
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return dispatchLocked(req)
+}
+
+// parseV2UploadPack splits a v2 upload-pack body into its command and the
+// argument lines after the delimiter. Pure computation on the body.
+func parseV2UploadPack(body []byte) (command string, lines []string) {
+	packets, _ := parsePackets(body, false)
+	afterDelim := false
+	for _, p := range packets {
+		if p.kind == "delim" {
+			afterDelim = true
+			continue
+		}
+		if p.kind != "data" {
+			continue
+		}
+		text := strings.TrimSuffix(string(p.payload), "\n")
+		if !afterDelim && strings.HasPrefix(text, "command=") {
+			command = text[8:]
+		} else if afterDelim {
+			lines = append(lines, text)
+		} else if strings.HasPrefix(text, "command=") {
+			command = text[8:]
+		}
+	}
+	return command, lines
+}
+
+// tryGitFastPath serves git advertisement / fetch / ls-refs from the
+// content-keyed caches without taking mu. A miss returns (nil, false) and
+// the caller runs the serialized path, which builds and stores the entry.
+func tryGitFastPath(req *request) (*response, bool) {
+	m := reGit.FindStringSubmatch(req.path)
+	if m == nil {
+		return nil, false
+	}
+	owner, _ := url.PathUnescape(m[1])
+	repoName, _ := url.PathUnescape(m[2])
+	sub := m[3]
+	if !authOk(req) {
+		return nil, false
+	}
+	var repo *Repo
+	if owner == viewer {
+		repo = getRepo(owner, repoName)
+	}
+	if repo == nil {
+		return nil, false
+	}
+	rv := int(repo.refVersion.Load())
+	if req.method == "GET" && sub == "/info/refs" {
+		service := req.q("service")
+		if service == "" {
+			service = "git-upload-pack"
+		}
+		if req.header("git-protocol") == "version=2" && service == "git-upload-pack" {
+			return rawResp(200, "application/x-git-upload-pack-advertisement", v2Advertisement), true
+		}
+		if hit := adCacheGet(repo, itoa(rv)+"|"+service); hit != nil {
+			return rawResp(200, "application/x-"+service+"-advertisement", hit), true
+		}
+		return nil, false
+	}
+	if req.method == "POST" && sub == "/git-upload-pack" {
+		if req.header("git-protocol") == "version=2" {
+			command, lines := parseV2UploadPack(req.body)
+			switch command {
+			case "ls-refs":
+				if hit := lsRefsCacheGet(repo, itoa(rv)+"|"+strings.Join(lines, "\n")); hit != nil {
+					return rawResp(200, "application/x-git-upload-pack-result", hit), true
+				}
+			case "fetch":
+				if hit := fetchCacheGet(repo, "v2|"+itoa(rv)+"|"+strings.Join(lines, "\n")); hit != nil {
+					return rawResp(200, "application/x-git-upload-pack-result", hit), true
+				}
+			}
+			return nil, false
+		}
+		if hit := fetchCacheGet(repo, "v0|"+itoa(rv)+"|"+hex.EncodeToString(req.body)); hit != nil {
+			return rawResp(200, "application/x-git-upload-pack-result", hit), true
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+// tryGetIssueFastPath serves a cached single-issue GET without taking mu:
+// the entry is valid only when its version matches the repo's current
+// issueVersion (bumped on every mutation of an issue's rendered fields).
+func tryGetIssueFastPath(req *request) (*response, bool) {
+	if req.method != "GET" {
+		return nil, false
+	}
+	m := reIssueFast.FindStringSubmatch(req.path)
+	if m == nil || m[3] == "" {
+		return nil, false
+	}
+	if !authOk(req) {
+		return nil, false
+	}
+	owner, _ := url.PathUnescape(m[1])
+	name, _ := url.PathUnescape(m[2])
+	r, errResp := repoFromPath(owner, name)
+	if errResp != nil {
+		return nil, false
+	}
+	num, _ := strconv.Atoi(m[3])
+	ver := r.issueVersion.Load()
+	r.cacheMu.RLock()
+	hit := r.issueJSONCache[num]
+	r.cacheMu.RUnlock()
+	if hit != nil && hit.version == ver {
+		return jsonResp(200, hit.buf), true
+	}
+	return nil, false
+}
+
+func dispatchLocked(req *request) (resp *response) {
+	defer func() {
+		if e := recover(); e != nil {
+			resp = jsonErr(500, "Internal Server Error")
+		}
+	}()
 	path := req.path
 	method := req.method
 
@@ -513,27 +654,7 @@ func dispatch(req *request) (resp *response) {
 		if method == "POST" && sub == "/git-upload-pack" {
 			v2 := req.header("git-protocol") == "version=2"
 			if v2 {
-				packets, _ := parsePackets(req.body, false)
-				var lines []string
-				command := ""
-				afterDelim := false
-				for _, p := range packets {
-					if p.kind == "delim" {
-						afterDelim = true
-						continue
-					}
-					if p.kind != "data" {
-						continue
-					}
-					text := strings.TrimSuffix(string(p.payload), "\n")
-					if !afterDelim && strings.HasPrefix(text, "command=") {
-						command = text[8:]
-					} else if afterDelim {
-						lines = append(lines, text)
-					} else if strings.HasPrefix(text, "command=") {
-						command = text[8:]
-					}
-				}
+				command, lines := parseV2UploadPack(req.body)
 				switch command {
 				case "ls-refs":
 					return rawResp(200, "application/x-git-upload-pack-result", handleLsRefs(repo, lines))
@@ -623,15 +744,41 @@ func dispatch(req *request) (resp *response) {
 					return jsonResp(200, issueJSONBuf(r, issue))
 				}
 				if method == "POST" && m[3] == "" {
-					obj, ok := parseJSONBody(req.body)
+					// Struct parse (v4): cheaper than a map decode, and the
+					// write workload only ever sends title/body/labels.
+					// Anything the struct cannot read falls back to the
+					// map parse so 400-vs-422 behavior is unchanged.
+					var cb issueCreateBody
+					bodyOK := true
+					if len(req.body) == 0 {
+						cb = issueCreateBody{}
+					} else if err := json.Unmarshal(req.body, &cb); err != nil {
+						bodyOK = false
+					}
+					var obj map[string]any
+					var ok bool
+					if bodyOK {
+						obj = nil
+						ok = true
+					} else {
+						obj, ok = parseJSONBody(req.body)
+					}
 					if !ok {
 						return jsonErr(400, "Problems parsing JSON")
 					}
-					title := asStr(obj, "title")
+					var title, bodyStr string
+					var labelNames []string
+					if bodyOK {
+						title, bodyStr = cb.Title, cb.Body
+						labelNames = labelNamesOfAny(cb.Labels)
+					} else {
+						title = asStr(obj, "title")
+						bodyStr = asStr(obj, "body")
+						labelNames = labelNamesOf(obj)
+					}
 					if title == "" {
 						return jsonErr(422, "Validation Failed: title is required")
 					}
-					labelNames := labelNamesOf(obj)
 					for _, ln := range labelNames {
 						if _, ok := r.labels[ln]; !ok {
 							return jsonErr(422, "Validation Failed: label \""+ln+"\" does not exist")
@@ -643,7 +790,7 @@ func dispatch(req *request) (resp *response) {
 					nextGlobalID++
 					issueSeq := nextGlobalID
 					nextGlobalID++
-					issue := &Issue{id: issueID, number: num, title: title, body: asStr(obj, "body"), state: "open", seq: issueSeq, comments: []Comment{}}
+					issue := &Issue{id: issueID, number: num, title: title, body: bodyStr, state: "open", seq: issueSeq, comments: []Comment{}}
 					for _, n := range labelNames {
 						issue.labels = append(issue.labels, r.labels[n])
 					}
@@ -661,17 +808,33 @@ func dispatch(req *request) (resp *response) {
 func labelNamesOf(obj map[string]any) []string {
 	var out []string
 	if arr, ok := obj["labels"].([]any); ok {
-		for _, l := range arr {
-			if s, ok := l.(string); ok {
-				out = append(out, s)
-			} else if m, ok := l.(map[string]any); ok {
-				out = append(out, asStr(m, "name"))
-			} else {
-				out = append(out, "")
-			}
+		out = labelNamesOfAny(arr)
+	}
+	return out
+}
+
+// labelNamesOfAny mirrors labelNamesOf for a decoded []any: string elements
+// pass through, objects contribute their "name", anything else is "".
+func labelNamesOfAny(arr []any) []string {
+	var out []string
+	for _, l := range arr {
+		if s, ok := l.(string); ok {
+			out = append(out, s)
+		} else if m, ok := l.(map[string]any); ok {
+			out = append(out, asStr(m, "name"))
+		} else {
+			out = append(out, "")
 		}
 	}
 	return out
+}
+
+// issueCreateBody is the hot-path issue-create request shape (v4): a struct
+// decode is much cheaper than the map decode parseJSONBody does.
+type issueCreateBody struct {
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	Labels []any  `json:"labels"`
 }
 
 func handleRest(req *request) *response {
@@ -771,7 +934,9 @@ func handleRest(req *request) *response {
 					return errResp
 				}
 				_ = r
+				reposMu.Lock()
 				delete(repos, repoKey(owner, name))
+				reposMu.Unlock()
 				return &response{status: 204, body: []byte{}}
 			}
 		}
@@ -1152,6 +1317,7 @@ func handleRest(req *request) *response {
 					if v, ok := obj["body"].(string); ok {
 						issue.body = v
 					}
+					touchIssue(r)
 					return jsonResp(200, issueJSONBuf(r, issue))
 				}
 			}
@@ -1163,6 +1329,7 @@ func handleRest(req *request) *response {
 					comment := Comment{id: nextGlobalID, body: asStr(obj, "body")}
 					nextGlobalID++
 					issue.comments = append(issue.comments, comment)
+					touchIssue(r)
 					return jsonResp(201, mustJSON(map[string]any{"id": comment.id, "body": comment.body}))
 				}
 				if method == "GET" {

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -25,12 +26,20 @@ const (
 
 var tokenEnv = os.Getenv("MAKEFUN_SHOP_TOKEN")
 
+// Locking (v4): the general dispatch path still serializes on mu, but the
+// perf-critical read paths (git fetch/advertisement/ls-refs, single-issue
+// GET) run lock-free on content-keyed caches: their keys are built from
+// atomic counters, so a cache hit needs no data lock at all. reposMu guards
+// the repos map itself (lookups are RLock, create/delete take Lock);
+// cacheMu guards one repo's response caches. Lock order, where both are
+// held, is always mu -> cacheMu, never the reverse.
 var (
-	mu           sync.Mutex // serializes request handlers; bodies parse outside it
+	mu           sync.Mutex // serializes the general (mutating / cold) dispatch path
+	reposMu      sync.RWMutex
 	repos        = map[string]*Repo{}
 	nextRepoID   = 1
 	nextGlobalID = 1
-	reqCounter   = 0
+	reqCounter   atomic.Int64
 )
 
 type Obj struct {
@@ -88,16 +97,15 @@ type treeEntry struct {
 }
 
 type issueCacheEntry struct {
-	buf       []byte
-	state     string
-	title     string
-	body      string
-	nComments int
-	nLabels   int
+	buf     []byte
+	version int64 // issueVersion at build time; a hit needs version == current
 }
 
-// Repo is one repository's whole state. All fields are guarded by the global
-// handler mutex, so no per-repo locking is needed.
+// Repo is one repository's whole state. Data fields are guarded by the
+// global handler mutex mu (general path); the response caches are guarded
+// by cacheMu so the lock-free fast paths can read them without mu.
+// refVersion/issueVersion are atomic so fast paths can key their cache
+// lookups without taking any lock.
 type Repo struct {
 	id            int
 	name          string
@@ -118,7 +126,9 @@ type Repo struct {
 	treeCache     map[string][]treeEntry
 	flatCache     map[string]map[string]string
 	// perf caches (all content-keyed, so a stale entry is impossible)
-	refVersion     int
+	refVersion     atomic.Int64
+	issueVersion   atomic.Int64
+	cacheMu        sync.RWMutex
 	issueJSONCache map[int]*issueCacheEntry
 	fetchCache     map[string][]byte
 	lsRefsCache    map[string][]byte
@@ -127,7 +137,11 @@ type Repo struct {
 
 func repoKey(owner, name string) string { return owner + "/" + name }
 
-func getRepo(owner, name string) *Repo { return repos[repoKey(owner, name)] }
+func getRepo(owner, name string) *Repo {
+	reposMu.RLock()
+	defer reposMu.RUnlock()
+	return repos[repoKey(owner, name)]
+}
 
 func createRepo(name string, isPrivate bool, description string) *Repo {
 	r := &Repo{
@@ -144,13 +158,20 @@ func createRepo(name string, isPrivate bool, description string) *Repo {
 	}
 	nextRepoID++
 	nextGlobalID++
+	reposMu.Lock()
 	repos[repoKey(viewer, name)] = r
+	reposMu.Unlock()
 	return r
 }
 
 // Every refs mutation goes through these so git response caches stay fresh.
-func setRef(r *Repo, name, oid string) { r.refs[name] = oid; r.refVersion++ }
-func delRef(r *Repo, name string)      { delete(r.refs, name); r.refVersion++ }
+func setRef(r *Repo, name, oid string) { r.refs[name] = oid; r.refVersion.Add(1) }
+func delRef(r *Repo, name string)      { delete(r.refs, name); r.refVersion.Add(1) }
+
+// touchIssue bumps the issue-generation counter; every mutation of an
+// existing issue's rendered fields (state/title/body/comments/labels)
+// must call it, or the lock-free single-issue cache can go stale.
+func touchIssue(r *Repo) { r.issueVersion.Add(1) }
 
 func sha1Hex(b []byte) string {
 	s := sha1.Sum(b)

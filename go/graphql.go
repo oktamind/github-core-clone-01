@@ -889,6 +889,7 @@ func executeGQLOp(query string, variables map[string]any) map[string]any {
 					continue
 				}
 				fi.state = "closed"
+				touchIssue(fr)
 				payload := map[string]any{"__type": "CloseIssuePayload", "issue": issueGQL(fr, fi), "clientMutationId": nil}
 				data[outName] = applySelection("CloseIssuePayload", payload, sel.selections, variables, &errors, parser)
 			case "createPullRequest":
@@ -943,6 +944,7 @@ func executeGQLOp(query string, variables map[string]any) map[string]any {
 				comment := Comment{id: nextGlobalID, body: asStr(input, "body")}
 				nextGlobalID++
 				fi.comments = append(fi.comments, comment)
+				touchIssue(fr)
 				payload := map[string]any{
 					"__type": "AddCommentPayload", "clientMutationId": nil,
 					"commentEdge": map[string]any{"__type": "CommentEdge", "node": map[string]any{"__type": "Comment", "id": gid("Comment", comment.id), "body": comment.body}, "cursor": b64("i:" + itoa(len(fi.comments)-1))},

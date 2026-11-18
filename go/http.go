@@ -13,8 +13,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+type hdr struct{ k, v string } // k is lower-cased at parse time
 
 type request struct {
 	method    string
@@ -22,13 +25,20 @@ type request struct {
 	path      string
 	rawQuery  string
 	query     url.Values
-	headers   map[string]string
+	headers   []hdr // small slice + linear scan: no map alloc per request
 	body      []byte
 	proto11   bool
 	keepAlive bool
 }
 
-func (r *request) header(k string) string { return r.headers[k] }
+func (r *request) header(k string) string {
+	for _, h := range r.headers {
+		if h.k == k {
+			return h.v
+		}
+	}
+	return ""
+}
 
 func (r *request) q(k string) string {
 	if r.query == nil {
@@ -88,9 +98,9 @@ func serveConn(c net.Conn) {
 		if err != nil {
 			return
 		}
-		mu.Lock()
+		// v4: dispatch takes mu itself for the general path; the fast
+		// paths inside it run lock-free, so no lock is held here.
 		resp := dispatch(req)
-		mu.Unlock()
 		if !writeResponse(c, req, resp) {
 			return
 		}
@@ -100,51 +110,89 @@ func serveConn(c net.Conn) {
 	}
 }
 
+// readLine reads one \n-terminated line without allocating (ReadSlice
+// returns a slice of the buffer); only over-long lines fall back to a
+// copying read. The returned slice is only valid until the next read.
+func readLine(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == nil {
+		return line, nil
+	}
+	if err != bufio.ErrBufferFull {
+		return nil, err
+	}
+	// Over-long line: accumulate it (rare; correctness over speed).
+	var out []byte
+	out = append(out, line...)
+	for {
+		chunk, err := br.ReadSlice('\n')
+		out = append(out, chunk...)
+		if err == nil {
+			return out, nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
+	}
+}
+
+func trimCRLF(b []byte) []byte {
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
 func readRequest(br *bufio.Reader, c net.Conn) (*request, error) {
 	// Skip stray empty lines before the request line.
-	var line string
+	var line []byte
 	var err error
 	for {
-		line, err = br.ReadString('\n')
+		line, err = readLine(br)
 		if err != nil {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if line != "" {
+		line = trimCRLF(line)
+		if len(line) != 0 {
 			break
 		}
 	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	// Request line: METHOD SP TARGET SP VERSION (no allocation beyond the
+	// two kept strings; path/query slice the target string).
+	sp1 := bytes.IndexByte(line, ' ')
+	sp2 := bytes.LastIndexByte(line, ' ')
+	if sp1 < 0 || sp2 <= sp1 {
 		return nil, fmt.Errorf("bad request line")
 	}
 	req := &request{
-		method:  parts[0],
-		target:  parts[1],
-		headers: map[string]string{},
-		proto11: parts[2] == "HTTP/1.1",
+		method:  string(line[:sp1]),
+		target:  string(line[sp1+1 : sp2]),
+		proto11: string(line[sp2+1:]) == "HTTP/1.1",
 	}
 	path, query, _ := strings.Cut(req.target, "?")
 	req.path = path
 	req.rawQuery = query
 	// Headers.
 	for {
-		h, err := br.ReadString('\n')
+		h, err := readLine(br)
 		if err != nil {
 			return nil, err
 		}
-		h = strings.TrimRight(h, "\r\n")
-		if h == "" {
+		h = trimCRLF(h)
+		if len(h) == 0 {
 			break
 		}
-		k, v, ok := strings.Cut(h, ":")
+		k, v, ok := bytes.Cut(h, []byte(":"))
 		if !ok {
 			continue
 		}
-		req.headers[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		req.headers = append(req.headers, hdr{
+			k: strings.ToLower(strings.TrimSpace(string(k))),
+			v: strings.TrimSpace(string(v)),
+		})
 	}
 	req.keepAlive = req.proto11
-	if conn := req.headers["connection"]; conn != "" {
+	if conn := req.header("connection"); conn != "" {
 		lc := strings.ToLower(conn)
 		if strings.Contains(lc, "close") {
 			req.keepAlive = false
@@ -153,19 +201,19 @@ func readRequest(br *bufio.Reader, c net.Conn) (*request, error) {
 		}
 	}
 	// 100-continue: answer the interim response so the client sends its body.
-	if strings.EqualFold(req.headers["expect"], "100-continue") {
+	if strings.EqualFold(req.header("expect"), "100-continue") {
 		if _, err := c.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n")); err != nil {
 			return nil, err
 		}
 	}
 	// Body.
-	if te := req.headers["transfer-encoding"]; strings.Contains(strings.ToLower(te), "chunked") {
+	if te := req.header("transfer-encoding"); strings.Contains(strings.ToLower(te), "chunked") {
 		body, err := readChunked(br)
 		if err != nil {
 			return nil, err
 		}
 		req.body = body
-	} else if cl := req.headers["content-length"]; cl != "" {
+	} else if cl := req.header("content-length"); cl != "" {
 		n, err := strconv.Atoi(strings.TrimSpace(cl))
 		if err != nil || n < 0 || n > 64<<20 {
 			return nil, fmt.Errorf("bad content-length")
@@ -184,26 +232,26 @@ func readRequest(br *bufio.Reader, c net.Conn) (*request, error) {
 func readChunked(br *bufio.Reader) ([]byte, error) {
 	var out bytes.Buffer
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLine(br)
 		if err != nil {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if i := strings.IndexByte(line, ';'); i >= 0 {
+		line = trimCRLF(line)
+		if i := bytes.IndexByte(line, ';'); i >= 0 {
 			line = line[:i]
 		}
-		n, err := strconv.ParseInt(strings.TrimSpace(line), 16, 64)
+		n, err := strconv.ParseInt(strings.TrimSpace(string(line)), 16, 64)
 		if err != nil || n < 0 || n > 64<<20 {
 			return nil, fmt.Errorf("bad chunk size")
 		}
 		if n == 0 {
 			// Trailers until an empty line.
 			for {
-				t, err := br.ReadString('\n')
+				t, err := readLine(br)
 				if err != nil {
 					return nil, err
 				}
-				if strings.TrimRight(t, "\r\n") == "" {
+				if len(trimCRLF(t)) == 0 {
 					break
 				}
 			}
@@ -220,8 +268,15 @@ func readChunked(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
+// hbPool reuses the header buffers writeResponse builds per response.
+var hbPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func writeResponse(c net.Conn, req *request, resp *response) bool {
-	var hb bytes.Buffer
+	hb := hbPool.Get().(*bytes.Buffer)
+	defer func() {
+		hb.Reset()
+		hbPool.Put(hb)
+	}()
 	bodyLen := len(resp.body)
 	if resp.noBody {
 		bodyLen = 0
@@ -232,11 +287,8 @@ func writeResponse(c net.Conn, req *request, resp *response) bool {
 		hb.WriteString("Content-Type: " + resp.ctype + "\r\n")
 	}
 	hb.WriteString("Content-Length: " + itoa(bodyLen) + "\r\n")
-	mu.Lock()
-	reqCounter++
-	id := reqCounter
-	mu.Unlock()
-	hb.WriteString("X-GitHub-Request-Id: req-" + itoa(id) + "\r\n")
+	id := reqCounter.Add(1)
+	hb.WriteString("X-GitHub-Request-Id: req-" + itoa(int(id)) + "\r\n")
 	for k, v := range resp.headers {
 		hb.WriteString(k + ": " + v + "\r\n")
 	}
